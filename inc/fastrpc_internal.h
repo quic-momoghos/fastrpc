@@ -5,6 +5,11 @@
 #define FASTRPC_INTERNAL_H
 
 #include <errno.h>
+/* ENOKEY (126 - Required key not available) is Linux-specific.
+ * Define it here if the platform (e.g. Zephyr) does not provide it. */
+#ifndef ENOKEY
+#define ENOKEY 126
+#endif
 #include <stdbool.h>
 #include <semaphore.h>
 

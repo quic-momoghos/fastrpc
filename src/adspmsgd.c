@@ -89,7 +89,9 @@ static void *adspmsgd_reader(void *arg) {
   msgd_handle->threadStop = -1;
 bail:
   if (nErr != AEE_SUCCESS) {
-    VERIFY_EPRINTF("Error 0x%x: %s thread of domain %d for handle 0x%lx "
+    /* remote_handle64 is typedef'd to unsigned long long; use %llx so the
+     * format specifier matches on all targets (clang -Wformat → -Werror). */
+    VERIFY_EPRINTF("Error 0x%x: %s thread of domain %d for handle 0x%llx "
                    "exiting (errno %s)\n",
                    nErr, __func__, domain, handle, strerror(errno));
   } else {
@@ -107,6 +109,7 @@ int adspmsgd_init(remote_handle64 handle, int filter) {
   char *filename = NULL;
   msgd *msgd_handle = &androidmsgd_handle[DEFAULT_DOMAIN_ID];
   VERIFY(AEE_SUCCESS == (nErr = get_domain_from_handle(handle, &domain)));
+  FARF(ALWAYS, "%s; domain from handle is %d", __func__, domain);
   msgd_handle = &androidmsgd_handle[domain];
   if (msgd_handle->thread_running) {
     androidmsgd_handle[domain].threadStop = 1;
@@ -143,7 +146,7 @@ bail:
   if ((nErr != AEE_SUCCESS) &&
       (nErr != (int)(AEE_EUNSUPPORTED + DSP_AEE_EOFFSET))) {
     VERIFY_EPRINTF(
-        "Error 0x%x: %s failed for handle 0x%lx filter %d with errno %s\n",
+        "Error 0x%x: %s failed for handle 0x%llx filter %d with errno %s\n",
         nErr, __func__, handle, filter, strerror(errno));
     if (msgd_handle->message) {
       free(msgd_handle->message);

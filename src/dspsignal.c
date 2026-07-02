@@ -5,7 +5,13 @@
 #define VERIFY_PRINT_ERROR
 #endif
 #define FARF_ERROR 1
+/* FARF_HIGH may already be defined to 1 via the CMake compile-definitions
+ * (FARF_HIGH=1).  Redefining it to 0 here triggers -Wmacro-redefined which
+ * is promoted to an error by -Werror.  Undefine first so the local override
+ * is clean. */
+#undef  FARF_HIGH
 #define FARF_HIGH 0
+#undef  FARF_MEDIUM
 #define FARF_MEDIUM 0
 
 #include <string.h>

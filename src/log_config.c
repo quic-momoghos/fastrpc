@@ -15,6 +15,11 @@
 
 #define FARF_ERROR 1
 
+#ifdef __ZEPHYR__
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(log_config, CONFIG_FASTRPC_LOG_LEVEL);
+#endif
+
 #include "AEEStdErr.h"
 #include "AEEstd.h"
 #include "HAP_farf.h"
@@ -240,7 +245,12 @@ static int readLogConfigFromPath(int dom, const char *base, const char *file) {
        log_config_watcher[dom].fileToWatch, path, buf);
 
   // Parse farf file to get logmasks.
-  len = sscanf((const char *)buf, "0x%lx %511s", &farf_logmask, filenames);
+  /* farf_logmask is uint64_t (= unsigned long long on all Zephyr/Linux
+   * targets).  Use %llx so the format matches on both LP64 (Linux/balsam,
+   * where long == 64-bit) and LLP64 / ILP32 targets where long is 32-bit.
+   * Without this, clang -Wformat (promoted to -Werror) rejects %lx when
+   * the argument is uint64_t *. */
+  len = sscanf((const char *)buf, "0x%llx %511s", &farf_logmask, filenames);
 
   if (farf_logmask == LLONG_MAX || farf_logmask == (uint64_t)LLONG_MIN ||
       farf_logmask == 0) {
@@ -617,6 +627,7 @@ void deinitFileWatcher(int dom) {
 }
 
 int initFileWatcher(int dom) {
+  LOG_INF("file watcher init.");
   int nErr = AEE_SUCCESS;
   const char *fileExtension = ".farf";
   uint32_t len = 0;

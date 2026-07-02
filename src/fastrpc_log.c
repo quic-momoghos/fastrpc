@@ -11,6 +11,10 @@
 #include <limits.h>
 #include <unistd.h>
 
+#ifdef __ZEPHYR__
+#include <zephyr/kernel.h>   /* printk() */
+#endif
+
 #include "AEEStdErr.h"
 #include "fastrpc_config.h"
 #include "HAP_farf_internal.h"
@@ -164,6 +168,43 @@ void HAP_debug_runtime(int level, const char *file, int line,
   va_list argp;
   char *buf = NULL, *log = NULL;
 
+#ifdef __ZEPHYR__
+  /*
+   * Zephyr backend for runtime FARF messages.
+   *
+   * On Linux/Android, runtime FARF is gated by fastrpc_logmask which is
+   * set at run-time by reading a per-process .farf file (log_config.c).
+   * That file-watcher mechanism does not exist on Zephyr, so fastrpc_logmask
+   * stays 0 forever and every FARF(RUNTIME_*, ...) call is silently dropped.
+   *
+   * On Zephyr we bypass the mask entirely and route all runtime FARF messages
+   * directly to printk(), using the same level-to-prefix mapping as
+   * HAP_debug().  This makes FARF(RUNTIME_RPC_HIGH, ...) and friends visible
+   * on the console without requiring any run-time configuration.
+   */
+  {
+    const char *prefix;
+    char rtbuf[MAX_FARF_LEN];
+
+    switch (level) {
+    case HAP_LEVEL_RPC_ERROR:    prefix = "ERR"; break;
+    case HAP_LEVEL_RPC_FATAL:    prefix = "FTL"; break;
+    case HAP_LEVEL_RPC_CRITICAL: prefix = "CRT"; break;
+    case HAP_LEVEL_ERROR:        prefix = "ERR"; break;
+    case HAP_LEVEL_FATAL:        prefix = "FTL"; break;
+    case HAP_LEVEL_CRITICAL:     prefix = "CRT"; break;
+    default:                     prefix = "INF"; break;
+    }
+
+    va_start(argp, format);
+    vsnprintf(rtbuf, sizeof(rtbuf), format, argp);
+    va_end(argp);
+
+    printk("FASTRPC [%s] %s:%d: %s\n", prefix, file, line, rtbuf);
+  }
+  return;
+#endif /* __ZEPHYR__ */
+
   /*
    * Adding logs to persist buffer when level is set to
    * RUNTIME_RPC_CRITICAL and fastrpc_log mask is disabled.
@@ -275,6 +316,46 @@ void HAP_debug(const char *msg, int level, const char *filename, int line) {
            android_log_level_to_char(level), __progname, short_filename, line,
            msg);
   fflush(stdout);
+#elif defined(__ZEPHYR__)
+  /*
+   * Zephyr backend for FARF/HAP_debug.
+   *
+   * HAP_debug() is the single sink that every FARF(x, ...) call reaches
+   * after being formatted by HAP_debug_v2().  On Linux/Android the platform
+   * provides __android_log_print / syslog / printf; on Zephyr none of those
+   * exist, so without this branch every FARF call is silently discarded.
+   *
+   * We use printk() because:
+   *   - it is always available regardless of CONFIG_LOG
+   *   - it is ISR-safe and does not require a LOG_MODULE_REGISTER in this TU
+   *   - it goes directly to the console backend (UART / RTT / etc.)
+   *
+   * Level mapping (HAP → printk prefix):
+   *   LOW / MEDIUM / HIGH / RPC_*  → [INF]
+   *   ERROR / RPC_ERROR            → [ERR]
+   *   FATAL / RPC_FATAL            → [FTL]
+   *   CRITICAL / RPC_CRITICAL      → [CRT]
+   */
+  const char *prefix;
+
+  switch (level) {
+  case HAP_LEVEL_ERROR:
+  case HAP_LEVEL_RPC_ERROR:
+    prefix = "ERR";
+    break;
+  case HAP_LEVEL_FATAL:
+  case HAP_LEVEL_RPC_FATAL:
+    prefix = "FTL";
+    break;
+  case HAP_LEVEL_CRITICAL:
+  case HAP_LEVEL_RPC_CRITICAL:
+    prefix = "CRT";
+    break;
+  default:
+    prefix = "INF";
+    break;
+  }
+  printk("FASTRPC [%s] %s:%d: %s\n", prefix, filename, line, msg);
 #endif
 }
 

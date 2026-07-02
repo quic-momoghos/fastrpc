@@ -7,9 +7,15 @@
 #ifndef VERIFY_PRINT_WARN
 #define VERIFY_PRINT_WARN
 #endif //VERIFY_PRINT_WARN
+#ifndef FARF_ERROR
 #define FARF_ERROR 1
+#endif
+#ifndef FARF_HIGH
 #define FARF_HIGH 0
+#endif
+#ifndef FARF_MEDIUM
 #define FARF_MEDIUM 0
+#endif
 
 #include <stdlib.h>
 #include <AEEstd.h>
@@ -230,6 +236,7 @@ int fastrpc_create_context(fastrpc_context_create *create) {
 	VERIFYC(create->effec_domain_ids && !create->flags, AEE_EBADPARM);
 	VERIFYC(num_domain_ids && num_domain_ids < NUM_DOMAINS_EXTEND,
 		AEE_EBADPARM);
+	printk("fastrpc_create_context \n");
 
 	VERIFYC(NULL != (ctx = fastrpc_context_init(num_domain_ids)),
 		AEE_EBADCONTEXT);

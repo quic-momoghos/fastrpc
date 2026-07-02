@@ -15,9 +15,20 @@
 #include <semaphore.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef __ZEPHYR__
+/* On Zephyr, eventfd is provided by the Zephyr POSIX layer (CONFIG_EVENTFD=y).
+ * Use <zephyr/posix/sys/eventfd.h> instead of the Linux <sys/eventfd.h>.
+ * This is the same include used in adsp_default_listener_zephyr.c. */
+#include <zephyr/posix/sys/eventfd.h>
+#else
 #include <sys/eventfd.h>
+#endif
 #include <unistd.h>
-#include <inttypes.h>
+
+#ifdef __ZEPHYR__
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(listener_android, CONFIG_FASTRPC_LOG_LEVEL);
+#endif
 
 #include "AEEStdErr.h"
 #include "AEEstd.h"
@@ -35,6 +46,42 @@
 #include "verify.h"
 #include "fastrpc_hash_table.h"
 
+#ifdef __ZEPHYR__
+#include <zephyr/kernel.h>
+/*
+ * Zephyr pthread_create() requires an explicit stack; passing attr = NULL
+ * (as the Linux path does) returns EINVAL because Zephyr's pthread layer
+ * marks a default-constructed attr as "not runnable" when no stack has been
+ * set.  Define one stack slot per effective domain so each call to
+ * listener_android_domain_init() gets its own pre-allocated stack.
+ *
+ * Stack size is tunable via CONFIG_FASTRPC_LISTENER_STACK_SIZE; the default
+ * of 8 KB is sufficient for the listener thread's call depth.
+ */
+#ifndef CONFIG_FASTRPC_LISTENER_STACK_SIZE
+/*
+ * 16 KB required: the listener() function places remote_arg args[512] on the
+ * stack.  On ARM64, remote_arg = 16 bytes → args[512] = 8192 bytes alone.
+ * Adding other locals (~136 bytes) + call overhead (~64 bytes) = ~8392 bytes
+ * total, which overflows an 8192-byte stack causing a crash.
+ * 16 KB provides sufficient headroom.
+ */
+#define CONFIG_FASTRPC_LISTENER_STACK_SIZE 16384
+#endif
+/*
+ * Number of concurrent listener thread stacks to pre-allocate.
+ * Each slot costs CONFIG_FASTRPC_LISTENER_STACK_SIZE bytes in the noinit
+ * section.  Keep this at 1 for targets with limited RAM; increase it when
+ * multiple domains must run listener threads simultaneously.
+ */
+#ifndef CONFIG_FASTRPC_LISTENER_MAX_DOMAINS
+#define CONFIG_FASTRPC_LISTENER_MAX_DOMAINS 4
+#endif
+#define LISTENER_MAX_DOMAINS CONFIG_FASTRPC_LISTENER_MAX_DOMAINS
+K_THREAD_STACK_ARRAY_DEFINE(listener_thread_stacks, LISTENER_MAX_DOMAINS,
+			     CONFIG_FASTRPC_LISTENER_STACK_SIZE);
+#endif /* __ZEPHYR__ */
+
 typedef struct {
   pthread_t thread;
   int eventfd;
@@ -42,6 +89,9 @@ typedef struct {
   int params_updated;
   sem_t *r_sem;
   remote_handle64 adsp_listener1_handle;
+#ifdef __ZEPHYR__
+  struct k_sem exit_sem; /* Zephyr-native exit signal — replaces eventfd */
+#endif
   ADD_DOMAIN_HASH();
 } listener_config;
 
@@ -129,12 +179,12 @@ static void listener(listener_config *me) {
   struct sbuf buf;
   eventfd_t event = 0xff;
 
-  FARF(ALWAYS, "%s thread starting\n", __func__);
+  FARF(ALWAYS, "%s thread starting tid: %p \n", __func__, (void *)k_current_get());
   memset(args, 0, sizeof(args));
   if (eheap || eflags || emin) {
     FARF(RUNTIME_RPC_HIGH,
-         "listener using ion heap: %d flags: %x cache: %" PRId64 "\n",
-         (int)heapid, (int)flags, cache_size);
+         "listener using ion heap: %d flags: %x cache: %lld\n", (int)heapid,
+         (int)flags, cache_size);
   }
 
   do {
@@ -187,6 +237,20 @@ static void listener(listener_config *me) {
         goto bail;
       }
     }
+#ifdef __ZEPHYR__
+    /*
+     * adsp_listener1_next2() is a stub (transport not ready): it returns 0
+     * but never writes ctx/handle/sc.  sc retains the 0xffffffff sentinel
+     * set at the top of the loop.  Without this guard the loop spins at
+     * 100% CPU — sc=0xffffffff has INHANDLES=0xf > 0, so the INHANDLES
+     * check fires, sets result=AEE_EBADPARM, and goto invoke loops forever.
+     */
+    if (handle == 0 && sc == 0) {
+        FARF(ALWAYS, "%s: adsp_listener1_next2 returned handle=0 sc=0"
+             " — DSP not up (stub output), exiting listener\n", __func__);
+        goto bail;
+    }
+#endif /* __ZEPHYR__ */
     FASTRPC_GET_REF(domain);
     if (__builtin_smul_overflow(inBufsLenReq, 2, &bufs_len)) {
       FARF(ERROR,
@@ -297,6 +361,36 @@ static void listener(listener_config *me) {
     result = mod_table_invoke(handle, sc, args);
     if (result && is_process_exiting(domain))
       result = AEE_EBADSTATE; // override result as process is exiting
+#ifdef __ZEPHYR__
+    /*
+     * On Zephyr, only exit the listener loop for fatal DSP-side errors that
+     * indicate the DSP is truly gone (AEE_EBADSTATE).  All other mod_table
+     * failures — including AEE_EBADPARM from the DSP-side probe invocation
+     * (handle=0, sc=0) that arrives while the DSP is still initialising —
+     * are non-fatal: send the error code back to the DSP via the next
+     * adsp_listener1_next2() call (result != 0 path at the top of the loop)
+     * and wait for the next valid invocation, exactly as Linux does.
+     *
+     * Background: when the DSP first comes up it sends handle=0, sc=0.
+     * mod_table_invoke() dispatches to apps_remotectl_skel_invoke() (handle 0
+     * is registered as the "apps_remotectl" const handle).  The skel asserts
+     * INBUFS==2 but sc=0 has INBUFS=0, so it returns AEE_EBADPARM (0xe).
+     * That error is harmless — the DSP discards it and sends the real first
+     * invocation.  Exiting here was wrong: it caused a 100 ms restart loop
+     * (visible in the log at 00:00:32 and 00:01:12) because dsprpcd_zephyr.c
+     * unconditionally restarts the daemon on any non-zero return.
+     *
+     * The only case where we must exit is AEE_EBADSTATE, which means the DSP
+     * UserPD is in an irrecoverable state and no further invocations will
+     * arrive.  That case is already handled above by is_process_exiting().
+     */
+    if (result == AEE_EBADSTATE) {
+      FARF(ERROR, "%s: mod_table_invoke returned AEE_EBADSTATE for handle 0x%x"
+           " sc 0x%x — DSP UserPD is gone, exiting listener loop\n",
+           __func__, handle, sc);
+      goto bail;
+    }
+#endif /* __ZEPHYR__ */
   } while (1);
 bail:
   me->adsp_listener1_handle = INVALID_HANDLE;
@@ -310,6 +404,10 @@ bail:
           nErr, __func__, result, ctx, handle, sc, strerror(errno));
     }
   }
+#ifdef __ZEPHYR__
+  k_sem_give(&me->exit_sem);
+  FARF(ALWAYS, "%s thread exiting tid %p \n", __func__, (void *)k_current_get());
+#else
   for (i = 0; i < RETRY_WRITE; i++) {
     if (AEE_SUCCESS == (nErr = eventfd_write(me->eventfd, event))) {
       break;
@@ -324,6 +422,7 @@ bail:
   }
   FARF(ALWAYS, "%s thread exiting\n", __func__);
   dlerror();
+#endif /* __ZEPHYR__ */
 }
 
 extern int apps_remotectl_skel_invoke(uint32_t _sc, remote_arg *_pra);
@@ -340,6 +439,7 @@ static void *listener_start_thread(void *arg) {
   listener_config *me = (listener_config *)arg;
   int domain = me->domain;
   remote_handle64 adsp_listener1_handle = INVALID_HANDLE;
+  LOG_INF("listener start thread tid: %p.", (void *)k_current_get());
 
   /*
    * Need to set TLS key of listener thread to right domain.
@@ -358,6 +458,7 @@ static void *listener_start_thread(void *arg) {
       VERIFY(AEE_SUCCESS == (nErr = __QAIC_HEADER(adsp_listener_init2)()));
     } else if (nErr == AEE_SUCCESS) {
       me->adsp_listener1_handle = adsp_listener1_handle;
+      LOG_INF("adsp_listener1_handle saved.");
     }
   } else {
     VERIFY(AEE_SUCCESS == (nErr = __QAIC_HEADER(adsp_listener_init2)()));
@@ -423,12 +524,16 @@ void listener_android_domain_deinit(int domain) {
   }
   FARF(RUNTIME_RPC_HIGH, "fastrpc listener joined");
   me->adsp_listener1_handle = INVALID_HANDLE;
+#ifdef __ZEPHYR__
+  me->eventfd = -1; /* k_sem needs no close */
+#else
   if (me->eventfd != -1) {
     close(me->eventfd);
     FARF(RUNTIME_RPC_HIGH, "Closed Listener event_fd %d for domain %d\n",
          me->eventfd, domain);
     me->eventfd = -1;
   }
+#endif /* __ZEPHYR__ */
 }
 
 int listener_android_domain_init(int domain, int update_requested,
@@ -440,17 +545,79 @@ int listener_android_domain_init(int domain, int update_requested,
   if (!me) {
     ALLOC_AND_ADD_NEW_NODE_TO_TABLE(listener_config, domain, me);
   }
+
   me->eventfd = -1;
+#ifdef __ZEPHYR__
+  k_sem_init(&me->exit_sem, 0, 1);
+  me->eventfd = domain; /* dummy: domain ID, not a real fd */
+  FARF(RUNTIME_RPC_HIGH, "Initialized k_sem exit_sem for domain %d\n", domain);
+#else
   VERIFYC(-1 != (me->eventfd = eventfd(0, 0)), AEE_EBADPARM);
   FARF(RUNTIME_RPC_HIGH, "Opened Listener event_fd %d for domain %d\n",
        me->eventfd, domain);
+#endif /* __ZEPHYR__ */
   me->update_requested = update_requested;
   me->r_sem = r_sem;
   me->adsp_listener1_handle = INVALID_HANDLE;
   me->domain = domain;
+#ifdef __ZEPHYR__
+  /*
+   * On Zephyr, pthread_create() with attr = NULL returns EINVAL because
+   * the default-constructed attr has no stack and is therefore not
+   * "runnable".  Use the pre-allocated per-domain stack defined above.
+   */
+  {
+    pthread_attr_t attr;
+    /*
+     * Assign stack slots with a monotonic counter rather than using the
+     * raw domain value as an index.
+     *
+     * Root cause of the crash when rootpd + audiopd run simultaneously:
+     *   rootpd  uses eff_domain_id=8,  old logic: (8  < 1) ? 8  : 0 -> slot 0
+     *   audiopd uses eff_domain_id=16, old logic: (16 < 1) ? 16 : 0 -> slot 0
+     * Both threads shared listener_thread_stacks[0] and corrupted each other.
+     *
+     * Fix: atomic counter wrapping at LISTENER_MAX_DOMAINS guarantees each
+     * concurrent listener_android_domain_init() call gets a distinct slot.
+     * LISTENER_MAX_DOMAINS defaults to 2 (rootpd + audiopd) via Kconfig.
+     */
+    static atomic_t listener_stack_counter;
+    int stack_idx = (int)(atomic_inc(&listener_stack_counter)
+                          % (atomic_val_t)LISTENER_MAX_DOMAINS);
+
+    pthread_attr_init(&attr);
+#ifdef CONFIG_FASTRPC_LISTENER_INHERIT_PRIO
+    /*
+     * Inherit the calling daemon thread priority so the listener thread
+     * is scheduled immediately after pthread_create().
+     *
+     * Without this, the listener thread runs at the POSIX default
+     * priority (Zephyr prio 126 — lowest application priority).
+     * When a higher-priority daemon restart loop (prio 7) runs
+     * concurrently on another domain, the listener thread at prio 126
+     * is never scheduled — causing a 3+ minute starvation block until
+     * the other daemon exits and permanently frees a CPU core.
+     *
+     * Setting PTHREAD_INHERIT_SCHED explicitly after pthread_attr_init
+     * ensures k_thread_create uses the calling thread priority (7),
+     * eliminating the starvation entirely.
+     */
+    pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED);
+#endif /* CONFIG_FASTRPC_LISTENER_INHERIT_PRIO */
+    pthread_attr_setstack(&attr,
+                          listener_thread_stacks[stack_idx],
+                          CONFIG_FASTRPC_LISTENER_STACK_SIZE);
+    nErr = pthread_create(&me->thread, &attr, listener_start_thread,
+                          (void *)me);
+    pthread_attr_destroy(&attr);
+    VERIFY(AEE_SUCCESS == nErr);
+    LOG_INF("%s: listener start thread called tid %p.", __func__, (void *)k_current_get());
+  }
+#else
   VERIFY(AEE_SUCCESS ==
          (nErr = pthread_create(&me->thread, 0, listener_start_thread,
                                 (void *)me)));
+#endif /* __ZEPHYR__ */
 
   if (me->update_requested) {
     /*
@@ -492,5 +659,15 @@ bail:
   }
   return nErr;
 }
+
+#ifdef __ZEPHYR__
+int listener_android_wait_exit(int domain) {
+  listener_config *me = NULL;
+  GET_HASH_NODE(listener_config, domain, me);
+  if (!me) return -1;
+  k_sem_take(&me->exit_sem, K_FOREVER);
+  return 0;
+}
+#endif /* __ZEPHYR__ */
 
 PL_DEFINE(listener_android, listener_android_init, listener_android_deinit)

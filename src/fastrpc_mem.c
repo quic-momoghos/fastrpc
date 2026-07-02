@@ -59,6 +59,10 @@
 #include <sys/mman.h>
 #endif // __WIN32
 
+#ifdef __ZEPHYR__
+#include <zephyr/kernel.h>
+#endif
+
 #ifndef INT_MAX
 #define INT_MAX (int)(-1)
 #endif
@@ -123,6 +127,7 @@ struct fastrpc_remote_map_list {
 
 static struct fastrpc_remote_map_list memlist[NUM_DOMAINS_EXTEND];
 static struct static_map_list smaplst[NUM_DOMAINS_EXTEND];
+
 static struct mem_to_fd_list fdlist;
 static struct dma_handle_info dhandles[MAX_DMA_HANDLES];
 static int dma_handle_count = 0;
@@ -137,6 +142,7 @@ int fastrpc_mem_init(void) {
   pthread_mutex_init(&fdlist.mut, 0);
   QList_Ctor(&fdlist.ql);
   memset(dhandles, 0, sizeof(dhandles));
+
   FOR_EACH_EFFECTIVE_DOMAIN_ID(ii) {
     QList_Ctor(&smaplst[ii].ql);
     pthread_mutex_init(&smaplst[ii].mut, 0);
@@ -150,6 +156,7 @@ int fastrpc_mem_deinit(void) {
   int ii;
 
   pthread_mutex_destroy(&fdlist.mut);
+
   FOR_EACH_EFFECTIVE_DOMAIN_ID(ii) {
     pthread_mutex_destroy(&smaplst[ii].mut);
     pthread_mutex_destroy(&memlist[ii].mut);
@@ -192,10 +199,20 @@ static void *remote_register_fd_attr(int fd, size_t size, int attr) {
 
   VERIFYC(NULL != (tofd = calloc(1, sizeof(*tofd))), AEE_ENOMEMORY);
   QNode_CtorZ(&tofd->qn);
+#ifdef __ZEPHYR__
+  /* On Zephyr, mmap() is not available.  Use k_malloc() to obtain a unique
+   * virtual address that serves as a handle for the fd-to-buffer mapping.
+   * The pointer is never dereferenced for data access; it is only used as
+   * a key in the fdlist lookup table. */
+  buf = k_malloc(size > 0 ? size : 1);
+  VERIFYM(buf != NULL, AEE_ERPC,
+          "Error %x: k_malloc failed for fd %x, size %x\n", nErr, fd, size);
+#else
   VERIFYM((void *)-1 != (buf = mmap(0, size, PROT_NONE,
                                     MAP_ANONYMOUS | MAP_PRIVATE, -1, 0)),
           AEE_ERPC, "Error %x: mmap failed for fd %x, size %x\n", nErr, fd,
           size);
+#endif
   tofd->buf = buf;
   tofd->size = size;
   tofd->fd = fd;
@@ -208,10 +225,19 @@ static void *remote_register_fd_attr(int fd, size_t size, int attr) {
 
   tofd = 0;
   po = buf;
+#ifdef __ZEPHYR__
+  buf = NULL; /* prevent bail from freeing the successfully registered buffer */
+#else
   buf = (void *)-1;
+#endif
 bail:
+#ifdef __ZEPHYR__
+  if (buf != NULL)
+    k_free(buf);
+#else
   if (buf != (void *)-1)
     munmap(buf, size);
+#endif
   if (tofd) {
     free(tofd);
     tofd = NULL;
@@ -309,7 +335,11 @@ static int remote_register_buf_common(void *buf, size_t size, int fd,
         try_unmap_buffer(freefd);
       }
       if (freefd->nova) {
+#ifdef __ZEPHYR__
+        k_free(freefd->buf);
+#else
         munmap(freefd->buf, freefd->size);
+#endif
       }
       free(freefd);
       freefd = NULL;
@@ -327,6 +357,7 @@ static int remote_register_buf_common(void *buf, size_t size, int fd,
       raise(SIGABRT);
     }
   }
+
 bail:
   if (nErr != AEE_SUCCESS) {
     if (0 == check_rpc_error(nErr)) {
@@ -782,8 +813,8 @@ int remote_mem_map(int domain, int fd, int flags, uint64_t vaddr, size_t size,
   VERIFY(AEE_SUCCESS == (nErr = fastrpc_init_once()));
 
   FARF(RUNTIME_RPC_HIGH,
-       "%s: domain %d fd %d addr 0x%" PRIx64 " size 0x%zx flags 0x%x",
-       __func__, domain, fd, vaddr, size, flags);
+       "%s: domain %d fd %d addr 0x%llx size 0x%zx flags 0x%x", __func__,
+       domain, fd, vaddr, size, flags);
 
   VERIFYC(fd >= 0, AEE_EBADPARM);
   VERIFYC(size >= 0, AEE_EBADPARM);
@@ -805,8 +836,8 @@ bail:
     nErr = convert_kernel_to_user_error(nErr, errno);
     if (0 == check_rpc_error(nErr)) {
       FARF(ERROR,
-           "Error 0x%x: %s failed to map buffer fd %d addr 0x%" PRIx64
-           " size 0x%zx domain %d flags %d errno %s",
+           "Error 0x%x: %s failed to map buffer fd %d addr 0x%llx size 0x%zx "
+           "domain %d flags %d errno %s",
            nErr, __func__, fd, vaddr, size, domain, flags, strerror(errno));
     }
   }
@@ -820,8 +851,8 @@ int remote_mem_unmap(int domain, uint64_t raddr, size_t size) {
 
   VERIFYC(size >= 0, AEE_EBADPARM);
   VERIFYC(raddr != 0, AEE_EBADPARM);
-  FARF(RUNTIME_RPC_HIGH, "%s: domain %d addr 0x%" PRIx64 " size 0x%zx",
-       __func__, domain, raddr, size);
+  FARF(RUNTIME_RPC_HIGH, "%s: domain %d addr 0x%llx size 0x%zx", __func__,
+       domain, raddr, size);
   if (domain == -1) {
     domain = get_current_domain();
   }
@@ -837,8 +868,8 @@ bail:
     nErr = convert_kernel_to_user_error(nErr, errno);
     if (0 == check_rpc_error(nErr)) {
       FARF(ERROR,
-           "Error 0x%x: %s failed to unmap buffer addr 0x%" PRIx64
-           " size 0x%zx domain %d errno %s",
+           "Error 0x%x: %s failed to unmap buffer addr 0x%llx size 0x%zx "
+           "domain %d errno %s",
            nErr, __func__, raddr, size, domain, strerror(errno));
     }
   }
@@ -878,8 +909,8 @@ bail:
   if (nErr != AEE_SUCCESS) {
     nErr = convert_kernel_to_user_error(nErr, errno);
     FARF(ERROR,
-         "Error 0x%x: %s failed for fd 0x%x of size %" PRId64 " (flags 0x%x, "
-         "vaddrin 0x%" PRIx64 ") errno %s\n",
+         "Error 0x%x: %s failed for fd 0x%x of size %lld (flags 0x%x, vaddrin "
+         "0x%llx) errno %s\n",
          nErr, __func__, fd, size, flags, vaddrin, strerror(errno));
   }
   return nErr;
@@ -905,8 +936,8 @@ int remote_mmap64(int fd, uint32_t flags, uint64_t vaddrin, int64_t size,
 bail:
   if ((nErr != AEE_SUCCESS) && (log == 1)) {
     FARF(ERROR,
-         "Error 0x%x: %s failed for fd 0x%x of size %" PRId64 " (flags 0x%x, "
-         "vaddrin 0x%" PRIx64 ")\n",
+         "Error 0x%x: %s failed for fd 0x%x of size %lld (flags 0x%x, vaddrin "
+         "0x%llx)\n",
          nErr, __func__, fd, size, flags, vaddrin);
   }
   return nErr;
@@ -928,6 +959,7 @@ bail:
 int remote_munmap64(uint64_t vaddrout, int64_t size) {
   int dev, domain = DEFAULT_DOMAIN_ID, nErr = AEE_SUCCESS, ref = 0;
   uint32_t rflags;
+  QNode *pn, *pnn;
   struct fastrpc_remote_map *mNode = NULL;
 
   VERIFY(AEE_SUCCESS == (nErr = fastrpc_init_once()));
@@ -960,8 +992,8 @@ bail:
   if (nErr != AEE_SUCCESS) {
     nErr = convert_kernel_to_user_error(nErr, errno);
     FARF(ERROR,
-         "Error 0x%x: %s failed for size %" PRId64 " (vaddrout 0x%" PRIx64 ") "
-         "errno %s\n", nErr, __func__, size, vaddrout, strerror(errno));
+         "Error 0x%x: %s failed for size %lld (vaddrout 0x%llx) errno %s\n",
+         nErr, __func__, size, vaddrout, strerror(errno));
   }
   return nErr;
 }
@@ -1091,6 +1123,7 @@ int fastrpc_mem_open(int domain) {
   }
   nErr = 0; // Try mapping is optional. Ignore error
   pthread_mutex_unlock(&fdlist.mut);
+
 bail:
   if (nErr) {
     FARF(ERROR, "Error 0x%x: %s failed for domain %d", nErr, __func__, domain);
@@ -1123,7 +1156,7 @@ int fastrpc_mem_close(int domain) {
   } while (mNode);
   pthread_mutex_unlock(&smaplst[domain].mut);
 
-  // Remove mapping status of static buffers
+  /* Remove mapping status of static buffers in global fdlist */
   pthread_mutex_lock(&fdlist.mut);
   QLIST_NEXTSAFE_FOR_ALL(&fdlist.ql, pn, pnn) {
     tofd = STD_RECOVER_REC(struct mem_to_fd, qn, pn);
@@ -1135,6 +1168,7 @@ int fastrpc_mem_close(int domain) {
     }
   }
   pthread_mutex_unlock(&fdlist.mut);
+
 bail:
   return nErr;
 }

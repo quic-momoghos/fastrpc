@@ -108,8 +108,14 @@ int fastrpc_get_cap(uint32_t domain, uint32_t attributeID, uint32_t *capability)
       }
       goto bail;
    }
+   printk("fastrpc_get_cap called. \n");
 
+#ifdef __ZEPHYR__
+   /* eff. domain id passed */
+   VERIFY(AEE_SUCCESS == (nErr = fastrpc_session_open(domain, &dev)));
+#else
    VERIFY(AEE_SUCCESS == (nErr = fastrpc_session_open(dom, &dev)));
+#endif /* __ZEPHYR__ */
    errno = 0;
    nErr = ioctl_getdspinfo(dev, dom, attributeID, capability);
    if(nErr) {
@@ -120,8 +126,21 @@ int fastrpc_get_cap(uint32_t domain, uint32_t attributeID, uint32_t *capability)
    }
 
 bail:
-   if(dev != -1)
+   if(dev != -1) {
+#ifdef __ZEPHYR__
+      /*
+       * On Zephyr, fastrpc_session_open() was called with the effective
+       * domain ID (not the base domain 'dom'), so dev == hlist[domain].dev.
+       * fastrpc_session_close() must also receive the effective domain ID;
+       * passing 'dom' (the base domain) causes it to see
+       * hlist[dom].dev == INVALID_DEVICE and unconditionally call
+       * close_device_node(), which tears down the still-needed session.
+       */
+      fastrpc_session_close(domain, dev);
+#else
       fastrpc_session_close(dom, dev);
+#endif
+   }
    if (nErr) {
       FARF(ERROR, "Warning 0x%x: %s failed to get attribute %u for domain %u (errno %s)", nErr, __func__, attributeID, domain, strerror(errno));
    }

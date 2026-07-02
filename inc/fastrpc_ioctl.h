@@ -4,14 +4,18 @@
 #ifndef FASTRPC_INTERNAL_UPSTREAM_H
 #define FASTRPC_INTERNAL_UPSTREAM_H
 
+/* On Zephyr, sys/ioctl.h does not exist; the ioctl() syscall is not used.
+ * linux/types.h is provided by zephyr_compat/linux/types.h shim. */
+#ifndef __ZEPHYR__
 #include <sys/ioctl.h>
+#endif
 #include <linux/types.h>
 
 /* File only compiled  when support to upstream kernel is required*/
 
-
+#ifndef __ZEPHYR__
 /**
- * FastRPC IOCTL functions
+ * FastRPC IOCTL functions — not needed on Zephyr (driver API called directly)
  **/
 #define FASTRPC_IOCTL_ALLOC_DMA_BUFF		_IOWR('R', 1, struct fastrpc_ioctl_alloc_dma_buf)
 #define FASTRPC_IOCTL_FREE_DMA_BUFF		_IOWR('R', 2, __u32)
@@ -25,6 +29,7 @@
 #define FASTRPC_IOCTL_MEM_MAP			_IOWR('R', 10, struct fastrpc_ioctl_mem_map)
 #define FASTRPC_IOCTL_MEM_UNMAP			_IOWR('R', 11, struct fastrpc_ioctl_mem_unmap)
 #define FASTRPC_IOCTL_GET_DSP_INFO		_IOWR('R', 13, struct fastrpc_ioctl_capability)
+#endif /* !__ZEPHYR__ */
 
 #define ADSPRPC_DEVICE "/dev/fastrpc-adsp"
 #define SDSPRPC_DEVICE "/dev/fastrpc-sdsp"
@@ -82,12 +87,20 @@
 #define FASTRPC_MAX_DSP_ATTRIBUTES_FALLBACK  1
 #endif
 
+/* On Zephyr, struct fastrpc_invoke_args is defined in
+ * <zephyr/drivers/fastrpc.h> using portable stdint types.
+ * Including it here avoids a redefinition error when
+ * fastrpc_ioctl_zephyr.c also includes that header. */
+#ifdef __ZEPHYR__
+#include <fastrpc_kmd/inc/fastrpc.h>
+#else
 struct fastrpc_invoke_args {
 	__u64 ptr; /* pointer to invoke address*/
 	__u64 length; /* size*/
 	__s32 fd; /* fd */
 	__u32 attr; /* invoke attributes */
 };
+#endif /* __ZEPHYR__ */
 
 struct fastrpc_ioctl_invoke {
 	__u32 handle;

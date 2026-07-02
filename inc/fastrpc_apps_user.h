@@ -103,6 +103,13 @@ int get_logger_state(int domain);
  */
 int fastrpc_session_open(int domain, int *dev);
 
+/**
+ * fastrpc_release_session_reservation() - Release a session slot reserved by
+ * FASTRPC_RESERVE_NEW_SESSION without a full domain_deinit.
+ * Safe to call even if domain_deinit already ran (idempotent).
+ */
+void fastrpc_release_session_reservation(int eff_domain_id);
+
 /* Lock and unlock fastrpc session handler */
 void fastrpc_session_lock(int domain);
 void fastrpc_session_unlock(int domain);

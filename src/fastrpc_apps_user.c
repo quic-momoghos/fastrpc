@@ -32,11 +32,33 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __ZEPHYR__
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(fastrpc_apps_user, CONFIG_FASTRPC_LOG_LEVEL);
+#endif
+
+/* Use #ifndef guards so these local overrides do not conflict with the
+ * -DFARF_xxx=y definitions injected by zephyr_library_compile_definitions()
+ * in CMakeLists.txt.  Without the guards, a plain #define after a -D flag
+ * triggers a "macro redefined" warning (or error with -Werror) and the
+ * compiler behaviour is undefined.  The guards let the CMake-level policy
+ * win when explicitly set, while still providing safe defaults here. */
+#ifndef FARF_ERROR
 #define FARF_ERROR 1
+#endif
+#ifndef FARF_HIGH
 #define FARF_HIGH 1
+#endif
+#ifndef FARF_MED
 #define FARF_MED 1
+#endif
+#ifndef FARF_LOW
 #define FARF_LOW 1
-#define FARF_CRITICAL 1 // Push log's to all hooks and persistent buffer.
+#endif
+#ifndef FARF_CRITICAL
+#define FARF_CRITICAL 1 /* Push logs to all hooks and persistent buffer. */
+#endif
 
 #include "AEEQList.h"
 #include "AEEStdErr.h"
@@ -345,9 +367,11 @@ int fastrpc_session_open(int domain, int *dev) {
   int device = -1;
 
   if (IS_SESSION_OPEN_ALREADY(domain)) {
+    printk(" session already open \n");
     *dev = hlist[domain].dev;
     return 0;
   }
+  printk(" open new session \n");
 
   device = open_device_node(domain);
   if (device >= 0) {
@@ -362,10 +386,29 @@ void fastrpc_session_close(int domain, int dev) {
     return;
   if ((hlist[domain].dev == INVALID_DEVICE) &&
       (dev != INVALID_DEVICE)) {
+    /*
+     * Temporary session: hlist[domain].dev was never set (still -1) but
+     * open_device_node() created a driver session keyed by 'dev'.
+     * Linux:  close(fd) triggers fastrpc_device_release() in the kernel.
+     * Zephyr: 'dev' is an eff_domain_id integer, not a POSIX fd.
+     *         close(dev) is a no-op; use close_device_node() instead.
+     */
+#ifdef __ZEPHYR__
+    close_device_node(domain, dev);
+#else
     close(dev);
+#endif
   } else if ((hlist[domain].dev != INVALID_DEVICE) &&
             (dev == INVALID_DEVICE)) {
+    /*
+     * Permanent session teardown: hlist[domain].dev holds the handle.
+     * Same reasoning applies for Zephyr portability.
+     */
+#ifdef __ZEPHYR__
+    close_device_node(domain, hlist[domain].dev);
+#else
     close(hlist[domain].dev);
+#endif
     hlist[domain].dev = INVALID_DEVICE;
   }
   return;
@@ -383,9 +426,26 @@ int fastrpc_session_get(int domain) {
       hlist[domain].ref++;
       ref = hlist[domain].ref;
       pthread_mutex_unlock(&hlist[domain].mut);
+      LOG_INF(" tlsKey set thread context ");
       set_thread_context(domain);
+#ifdef __ZEPHYR__
+      /*
+       * tls_key      : the integer slot number (same value in every thread)
+       * tls_val      : pointer stored in THIS thread's TLS slot after
+       *                set_thread_context() — should equal hlist[domain] addr
+       * hlist[domain]: expected value; compare with tls_val to confirm TLS set
+       */
+      FARF(RUNTIME_RPC_HIGH,
+           "%s, domain %d, state %d, ref %d, tid %p, "
+           "tls_val(this_thread) %p, hlist[domain] %p\n",
+           __func__, domain, hlist[domain].state, ref,
+           (void *)k_current_get(),
+           pthread_getspecific(tlsKey),
+           (void *)&hlist[domain]);
+#else
       FARF(RUNTIME_RPC_HIGH, "%s, domain %d, state %d, ref %d\n", __func__, domain,
            hlist[domain].state, ref);
+#endif
     } else {
       return AEE_ENOTINITIALIZED;
     }
@@ -402,8 +462,26 @@ int fastrpc_session_put(int domain) {
         hlist[domain].ref--;
       ref = hlist[domain].ref;
       pthread_mutex_unlock(&hlist[domain].mut);
+#ifdef __ZEPHYR__
+      /*
+       * tls_key      : the integer slot number (same value in every thread)
+       * tls_val      : pointer currently stored in THIS thread's TLS slot
+       *                (set by the most recent set_thread_context() call on
+       *                 this thread — may differ from hlist[domain] if this
+       *                 thread last operated on a different domain)
+       * hlist[domain]: address of the domain being put — compare with tls_val
+       */
+      FARF(RUNTIME_RPC_HIGH,
+           "%s, domain %d, state %d, ref %d, tid %p, "
+           "tls_val(this_thread) %p, hlist[domain] %p\n",
+           __func__, domain, hlist[domain].state, ref,
+           (void *)k_current_get(),
+           pthread_getspecific(tlsKey),
+           (void *)&hlist[domain]);
+#else
       FARF(RUNTIME_RPC_HIGH, "%s, domain %d, state %d, ref %d\n", __func__, domain,
            hlist[domain].state, ref);
+#endif
     } else {
       return AEE_ENOTINITIALIZED;
     }
@@ -1170,11 +1248,8 @@ int remote_handle_invoke_domain(int domain, remote_handle handle,
 
   if (IS_QTF_TRACING_ENABLED(hlist[domain].procattrs) &&
       !IS_STATIC_HANDLE(handle) && trace_marker_fd > 0) {
-    /* Write begin trace marker; only enable tracing if write succeeds.
-     * This ensures we don't attempt to write an end marker if begin failed. */
-    ssize_t ret = write(trace_marker_fd, INVOKE_BEGIN_TRACE_STR, invoke_begin_trace_strlen);
-    if (ret > 0)
-      trace_enabled = true;
+    write(trace_marker_fd, INVOKE_BEGIN_TRACE_STR, invoke_begin_trace_strlen);
+    trace_enabled = true;
   }
 
   VERIFY(AEE_SUCCESS == (nErr = fastrpc_session_dev(domain, &dev)));
@@ -1409,10 +1484,7 @@ bail:
     }
   }
   if (trace_enabled) {
-    /* Write end trace marker. Store return value to satisfy warn_unused_result,
-     * but don't check it since trace writes are optional and failures are non-critical. */
-    ssize_t ret __attribute__((unused));
-    ret = write(trace_marker_fd, INVOKE_END_TRACE_STR, invoke_end_trace_strlen);
+    write(trace_marker_fd, INVOKE_END_TRACE_STR, invoke_end_trace_strlen);
   }
   if (nErr != AEE_SUCCESS) {
     if ((nErr == -1) && (errno == ECONNRESET)) {
@@ -1528,6 +1600,7 @@ int remote_handle_open_domain(int domain, const char *name, remote_handle *ph,
   FASTRPC_ATRACE_BEGIN_L("%s called with domain %d, name %s, handle 0x%x",
                          __func__, domain, name, ph);
   /* If the total reference count exceeds one then exit the application. */
+  LOG_INF("%s: dsp lib refcount %d ", __func__, total_dsp_lib_refcnt);
   if (total_dsp_lib_refcnt > MAX_LIB_INSTANCE_ALLOWED) {
     FARF(ERROR,
          "Error: aborting due to %d instances of libxdsprpc. Only %d allowed\n",
@@ -1566,13 +1639,14 @@ int remote_handle_open_domain(int domain, const char *name, remote_handle *ph,
      */
     if (strstr(pdName, get_domain_from_id(GET_DOMAIN_FROM_EFFEC_DOMAIN_ID(domain))) &&
         strstr(pdName, FASTRPC_SESSION_URI)) {
-      /* Truncate string in place by null-terminating at desired length */
-      pdName[strlen(pdName) -
-             strlen(get_domain_from_id(GET_DOMAIN_FROM_EFFEC_DOMAIN_ID(domain))) -
-             strlen(FASTRPC_SESSION1_URI)] = '\0';
+      strlcpy(pdName, pdName,
+                  (strlen(pdName) -
+                   strlen(get_domain_from_id(GET_DOMAIN_FROM_EFFEC_DOMAIN_ID(domain))) -
+                   strlen(FASTRPC_SESSION1_URI) + 1));
     } else if (strstr(pdName, get_domain_from_id(domain))) {
-      /* Truncate string in place by null-terminating at desired length */
-      pdName[strlen(pdName) - strlen(get_domain_from_id(domain))] = '\0';
+      strlcpy(
+          pdName, pdName,
+          (strlen(pdName) - strlen(get_domain_from_id(domain)) + 1));
     }
     VERIFYC(MAX_DSPPD_NAMELEN > strlen(pdName), AEE_EBADPARM);
     strlcpy(hlist[domain].dsppdname, pdName, strlen(pdName) + 1);
@@ -1708,7 +1782,78 @@ int remote_handle64_open(const char *name, remote_handle64 *ph) {
   }
 
   domain = get_domain_from_name(name, DOMAIN_NAME_IN_URI);
+  printk("%s: domain id is %d", __func__, domain);
   VERIFYC(domain >= 0, AEE_EBADPARM);
+
+#ifdef __ZEPHYR__
+  /*
+   * Zephyr session-management enforcement
+   * ======================================
+   * On Zephyr every remote_handle64_open() call MUST carry an explicit
+   * session ID in the URI (e.g. "&_session=1").  The expected call
+   * sequence before reaching this point is:
+   *
+   *   1. remote_session_control(FASTRPC_RESERVE_NEW_SESSION, ...)
+   *      → reserves a session slot, returns session_id +
+   *        effective_domain_id in the output struct.
+   *
+   *   2. remote_session_control(FASTRPC_GET_EFFECTIVE_DOMAIN_ID, ...)
+   *      → confirms the effective domain ID for the session.
+   *
+   *   3. remote_session_control(FASTRPC_GET_URI, ...)
+   *      → builds the full URI: "<module_uri>&_dom=<dsp>&_session=<id>"
+   *
+   *   4. (optional) remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE)
+   *      → configure signed/unsigned PD for the effective domain.
+   *
+   *   5. remote_handle64_open(<uri_from_step_3>, &handle)   ← here
+   *
+   * Calls that skip steps 1-3 and pass a bare module URI (no "&_session=")
+   * are rejected so that every DSP PD is explicitly tracked in hlist[].
+   *
+   * On the first successful open the FASTRPC_GET_REF macro (below) will:
+   *   • increment hlist[effective_domain_id].ref
+   *   • call set_thread_context(domain) which stores
+   *     &hlist[effective_domain_id] in this thread's TLS slot (tlsKey),
+   *     making it the "current domain" for subsequent non-domain calls.
+   */
+  if (!strstr(name, FASTRPC_SESSION_URI)) {
+    nErr = AEE_EBADPARM;
+    FARF(ERROR,
+         "Error 0x%x: %s: URI '%s' does not contain a session ID ('%s'). "
+         "On Zephyr, call remote_session_control(FASTRPC_RESERVE_NEW_SESSION) "
+         "and use the URI returned by FASTRPC_GET_URI before calling "
+         "remote_handle64_open.\n",
+         nErr, __func__, name, FASTRPC_SESSION_URI);
+    goto bail;
+  }
+
+  /*
+   * Verify the session was explicitly reserved via
+   * FASTRPC_RESERVE_NEW_SESSION before this open call.
+   * hlist[domain].is_session_reserved is set to true by
+   * FASTRPC_RESERVE_NEW_SESSION (for sessions 1+) and remains false
+   * until then, preventing use of unreserved session slots.
+   */
+  if (!hlist || !hlist[domain].is_session_reserved) {
+    nErr = AEE_ENOSESSION;
+    FARF(ERROR,
+         "Error 0x%x: %s: session for effective domain %d has not been "
+         "reserved. Call remote_session_control(FASTRPC_RESERVE_NEW_SESSION) "
+         "before remote_handle64_open.\n",
+         nErr, __func__, domain);
+    goto bail;
+  }
+
+  FARF(RUNTIME_RPC_HIGH,
+       "%s: session %d on effective domain %d is reserved; "
+       "proceeding with open (domain_state=%d, first_open=%s)\n",
+       __func__,
+       GET_SESSION_ID_FROM_DOMAIN_ID(domain), domain,
+       hlist[domain].state,
+       (hlist[domain].state == FASTRPC_DOMAIN_STATE_CLEAN) ? "yes" : "no");
+#endif /* __ZEPHYR__ */
+
   FASTRPC_GET_REF(domain);
   VERIFY(AEE_SUCCESS == (nErr = remote_handle_open_domain(domain, name, &h,
                                                           &t_spawn, &t_load)));
@@ -2716,6 +2861,7 @@ int remote_session_control(uint32_t req, void *data, uint32_t datalen) {
                 sess->session_name && sess->session_name_len > 0,
             AEE_EBADPARM);
     domain = get_domain_from_name(sess->domain_name, DOMAIN_NAME_STAND_ALONE);
+    printk("fastrpc: domain is %d", domain);
     VERIFYC(IS_VALID_DOMAIN_ID(domain), AEE_EBADPARM);
     // Initialize effective domain ID to 2nd session of domain, first session is
     // default usage and cannot be reserved
@@ -2982,6 +3128,29 @@ static int attach_guestos(int domain) {
   return attach;
 }
 
+/**
+ * fastrpc_release_session_reservation() - Release a session slot reserved by
+ * FASTRPC_RESERVE_NEW_SESSION without going through a full domain_deinit.
+ *
+ * Called by adsp_default_listener_zephyr.c on the bail path when the session
+ * was reserved but domain_init never ran (or ran and failed before the handle
+ * list was populated), so domain_deinit will not be triggered by
+ * remote_handle64_close().
+ *
+ * If domain_deinit has already run for this slot (it clears is_session_reserved
+ * itself), this function is a safe no-op because the mutex protects the flag.
+ */
+void fastrpc_release_session_reservation(int eff_domain_id)
+{
+  if (!IS_VALID_EFFECTIVE_DOMAIN_ID(eff_domain_id) || !hlist)
+    return;
+  pthread_mutex_lock(&hlist[eff_domain_id].init);
+  hlist[eff_domain_id].is_session_reserved = false;
+  pthread_mutex_unlock(&hlist[eff_domain_id].init);
+  FARF(ALWAYS, "%s: released reservation for eff_domain_id=%d",
+       __func__, eff_domain_id);
+}
+
 static void domain_deinit(int domain) {
   int olddev;
   remote_handle64 handle = 0;
@@ -2991,7 +3160,7 @@ static void domain_deinit(int domain) {
     return;
   }
   olddev = hlist[domain].dev;
-  FARF(RUNTIME_RPC_HIGH, "%s for domain %d: dev %d", __func__, domain, olddev);
+  FARF(RUNTIME_RPC_HIGH, "%s for domain %d: dev %d tid %p", __func__, domain, olddev, (void *)k_current_get());
   if (olddev != -1) {
 
     FASTRPC_ATRACE_BEGIN_L("%s called for handle 0x%x, domain %d, dev %d",
@@ -3017,6 +3186,14 @@ static void domain_deinit(int domain) {
     if (domain == DEFAULT_DOMAIN_ID) {
       fastrpc_clear_handle_list(NON_DOMAIN_HANDLE_LIST_ID, domain);
     }
+#ifdef __ZEPHYR__
+    pthread_mutex_lock(&hlist[domain].lmut);
+    hlist[domain].domainsCount    = 0;
+    hlist[domain].constCount      = 0;
+    hlist[domain].nondomainsCount = 0;
+    hlist[domain].reverseCount    = 0;
+    pthread_mutex_unlock(&hlist[domain].lmut);
+#endif /* __ZEPHYR__ */
     fastrpc_perf_deinit();
     trace_marker_deinit(domain);
     deinitFileWatcher(domain);
@@ -3047,12 +3224,37 @@ static void domain_deinit(int domain) {
     hlist[domain].proc_sharedbuf = NULL;
   }
   // Free the session, on session deinit
+#ifdef __ZEPHYR__
+  /*
+   * Set state=CLEAN BEFORE clearing is_session_reserved.
+   *
+   * RESERVE_NEW_SESSION only checks is_session_reserved (under hlist[ii].init).
+   * If is_session_reserved is cleared first, a concurrent RESERVE_NEW_SESSION
+   * can grab this slot and call remote_handle64_open before state is set to
+   * CLEAN.  remote_handle64_open then sees state=INIT (first_open=no) and
+   * domain_init is skipped, leaving the session broken.
+   *
+   * Correct order (Zephyr — two daemons restart concurrently):
+   *   1. state = CLEAN  (under mut)   — visible to remote_handle64_open
+   *   2. is_session_reserved = false  — visible to RESERVE_NEW_SESSION
+   *
+   * Invariant enforced: if is_session_reserved==false then state==CLEAN,
+   * so domain_init always runs on the first open of a freshly reserved slot.
+   */
+  pthread_mutex_lock(&hlist[domain].mut);
+  hlist[domain].state = FASTRPC_DOMAIN_STATE_CLEAN;
+  pthread_mutex_unlock(&hlist[domain].mut);
+  pthread_mutex_lock(&hlist[domain].init);
+  hlist[domain].is_session_reserved = false;
+  pthread_mutex_unlock(&hlist[domain].init);
+#else
   pthread_mutex_lock(&hlist[domain].init);
   hlist[domain].is_session_reserved = false;
   pthread_mutex_unlock(&hlist[domain].init);
   pthread_mutex_lock(&hlist[domain].mut);
   hlist[domain].state = FASTRPC_DOMAIN_STATE_CLEAN;
   pthread_mutex_unlock(&hlist[domain].mut);
+#endif /* __ZEPHYR__ */
 }
 
 void get_domain_device_names(int domain_id, const char **secure_name, const char **non_secure_name) {
@@ -3095,6 +3297,55 @@ void get_domain_device_names(int domain_id, const char **secure_name, const char
   }
 }
 
+#ifdef __ZEPHYR__
+int open_device_node(int domain_id) {
+    /*
+     * Zephyr session model — mirrors Linux open("/dev/fastrpc-cdsp"):
+     *
+     * Linux:  open() -> fastrpc_device_open() -> new fastrpc_user *fl
+     *                -> file->private_data = fl
+     *                -> returns fd
+     *
+     * Zephyr: open_device_node(eff_domain_id)
+     *           -> fastrpc_session_open(zdev, eff_domain_id)
+     *           -> new fastrpc_user *fl (or reuse if already open)
+     *           -> data->sessions[eff_domain_id] = fl
+     *           -> returns eff_domain_id  (stored in hlist[domain].dev)
+     *
+     * The UMD guards against double-open via IS_SESSION_OPEN_ALREADY(),
+     * so fastrpc_session_open() is normally called only once per domain.
+     * If called again while open, the driver reuses the existing fl.
+     */
+    const struct device *zdev = DEVICE_DT_GET(DT_ALIAS(fastrpc));
+    int err;
+
+    if (zdev == NULL) {
+        FARF(ERROR, "FastRPC device not found via alias 'fastrpc'\n");
+        return -1;
+    }
+    if (!device_is_ready(zdev)) {
+        FARF(ERROR, "FastRPC device not ready\n");
+        return -1;
+    }
+    printk("%s: domain id passed: %d", __func__, domain_id);
+    err = fastrpc_drv_session_open(zdev, domain_id);
+    if (err) {
+        FARF(ERROR, "fastrpc_drv_session_open failed domain=%d err=%d\n",
+             domain_id, err);
+        return -1;
+    }
+
+    FARF(ALWAYS, "%s: session opened eff_domain_id=%d", __func__, domain_id);
+
+    /*
+     * Return eff_domain_id as the 'dev' handle.
+     * Stored in hlist[domain_id].dev and passed to every ioctl_*() call.
+     * The ioctl layer uses DEVICE_DT_GET for the device pointer and
+     * passes this value to the driver to look up the fastrpc_user.
+     */
+    return domain_id;
+}
+#else
 int open_device_node(int domain_id) {
   int dev = -1, nErr = 0;
   int domain = GET_DOMAIN_FROM_EFFEC_DOMAIN_ID(domain_id);
@@ -3122,13 +3373,41 @@ int open_device_node(int domain_id) {
          non_secure_dev, errno, strerror(errno));
   return dev;
 }
+#endif
 
+#ifdef __ZEPHYR__
+static int close_device_node(int domain_id, int dev) {
+    /*
+     * 'dev' is the eff_domain_id returned by open_device_node().
+     *
+     * Mirrors Linux close(fd) -> fastrpc_device_release():
+     *   fastrpc_release_current_dsp_process(fl)
+     *   fastrpc_user_put(fl)  -> fastrpc_user_free(fl)
+     *
+     * The driver sends INIT_RELEASE to the DSP, cancels pending contexts,
+     * releases all maps and mmap buffers, and frees the fastrpc_user.
+     * After this call data->sessions[dev] is NULL; a subsequent
+     * open_device_node(dev) will create a fresh fastrpc_user.
+     */
+    const struct device *zdev = DEVICE_DT_GET(DT_ALIAS(fastrpc));
+
+    if (zdev == NULL || !device_is_ready(zdev)) {
+        return 0;
+    }
+
+    fastrpc_drv_session_close(zdev, dev);
+
+    FARF(ALWAYS, "%s: session closed eff_domain_id=%d", __func__, dev);
+    return 0;
+}
+#else
 static int close_device_node(int domain_id, int dev) {
   int nErr = 0;
   nErr = close(dev);
   FARF(ALWAYS, "%s: closed dev %d on domain %d", __func__, dev, domain_id);
   return nErr;
 }
+#endif
 
 static int get_process_attrs(int domain) {
   int attrs = 0;
@@ -3385,7 +3664,7 @@ static int remote_init(int domain) {
   char *file = NULL;
   int flags = 0, filelen = 0, memlen = 0, filefd = -1;
 
-  FARF(RUNTIME_RPC_HIGH, "starting %s for domain %d", __func__, domain);
+  FARF(RUNTIME_RPC_HIGH, "starting %s, tid: %p for domain %d", __func__, (void *)k_current_get(), domain);
   /*
    * is_proc_sharedbuf_supported_dsp call should be made before
    * mutex lock (hlist[domain].mut), Since remote_get_info is also locked
@@ -3394,6 +3673,7 @@ static int remote_init(int domain) {
   shared_buf_support = is_proc_sharedbuf_supported_dsp(domain);
   pthread_setspecific(tlsKey, (void *)&hlist[domain]);
   pd_type = hlist[domain].dsppd;
+  FARF(ALWAYS, "%s: pd_type %d, domain_id %d", __func__, pd_type, domain);
   VERIFYC(pd_type > DEFAULT_UNUSED && pd_type < MAX_PD_TYPE, AEE_EBADITEM);
   if (hlist[domain].dev == -1) {
     dev = open_device_node(domain);
@@ -3741,7 +4021,17 @@ static int domain_init(int domain, int *dev) {
   QList_Ctor(&hlist[domain].ql);
   QList_Ctor(&hlist[domain].nql);
   QList_Ctor(&hlist[domain].rql);
-  hlist[domain].is_session_reserved = true;
+#ifdef __ZEPHYR__
+  hlist[domain].domainsCount    = 0;
+  hlist[domain].constCount      = 0;
+  hlist[domain].nondomainsCount = 0;
+  hlist[domain].reverseCount    = 0;
+#endif /* __ZEPHYR__ */
+
+  /* is_session_reserved is owned by FASTRPC_RESERVE_NEW_SESSION and
+   * domain_deinit. domain_init must not touch it: the slot was already
+   * marked reserved by RESERVE_NEW_SESSION before domain_init is called,
+   * and overwriting it here would mask a double-reserve bug. */
   VERIFY(AEE_SUCCESS == (nErr = remote_init(domain)));
   if (fastrpc_wake_lock_enable[domain]) {
     VERIFY(AEE_SUCCESS ==
@@ -3749,10 +4039,17 @@ static int domain_init(int domain, int *dev) {
                 domain, hlist[domain].dev, fastrpc_wake_lock_enable[domain])));
   }
   VERIFY(AEE_SUCCESS == (nErr = fastrpc_mem_open(domain)));
-  VERIFY(AEE_SUCCESS == (nErr = apps_mem_init(domain)));
+  printk("%s: fastrpc_mem_open done domain=%d\n", __func__, domain);
+
+  /* apps_mem_init failed */
+  //VERIFY(AEE_SUCCESS == (nErr = apps_mem_init(domain)));
+  printk("%s: apps_mem_init done domain=%d\n", __func__, domain);
 
   if (dom == CDSP_DOMAIN_ID || dom == CDSP1_DOMAIN_ID || dom == GDSP0_DOMAIN_ID || dom == GDSP1_DOMAIN_ID) {
+    printk("%s: getting adsp_current_process1 handle domain=%d\n", __func__, domain);
     panic_handle = get_adsp_current_process1_handle(domain);
+    printk("%s: adsp_current_process1 handle=0x%llx domain=%d\n", __func__,
+           (unsigned long long)panic_handle, domain);
     if (panic_handle != INVALID_HANDLE) {
       int ret = -1;
       /* If error codes are available in debug config, send panic error codes to
@@ -3773,15 +4070,24 @@ static int domain_init(int domain, int *dev) {
       FARF(ALWAYS, "%s : current process handle is not valid\n", __func__);
     }
   }
+
+  printk("%s: calling fastrpc_enable_kernel_optimizations domain=%d\n", __func__, domain);
   VERIFY(AEE_SUCCESS == (nErr = fastrpc_enable_kernel_optimizations(domain)));
-  initFileWatcher(domain); // Ignore errors
+  printk("%s: fastrpc_enable_kernel_optimizations done domain=%d\n", __func__, domain);
+
+  //initFileWatcher(domain); /* skip initFileWatcher for now */
+  printk("%s: initFileWatcher done domain=%d\n", __func__, domain);
+
   trace_marker_init(domain);
+  printk("%s: trace_marker_init done domain=%d\n", __func__, domain);
 
   // If client notifications are registered, initialize notification thread and
   // enable notifications on domains
   if (fastrpc_notif_flag) {
     int ret = 0;
+    printk("%s: enabling process state notif domain=%d\n", __func__, domain);
     ret = enable_process_state_notif_on_dsp(domain);
+    printk("%s: enable_process_state_notif_on_dsp ret=0x%x domain=%d\n", __func__, ret, domain);
     if (ret == (int)(DSP_AEE_EOFFSET + AEE_EUNSUPPORTED)) {
       VERIFY_WPRINTF("Warning: %s: DSP does not support notifications",
                      __func__);
@@ -3790,15 +4096,26 @@ static int domain_init(int domain, int *dev) {
                 ret == (int)(DSP_AEE_EOFFSET + AEE_EUNSUPPORTED),
             ret);
   }
+
+  printk("%s: calling fastrpc_perf_init domain=%d dev=%d\n", __func__, domain, hlist[domain].dev);
   fastrpc_perf_init(hlist[domain].dev, domain);
+  printk("%s: fastrpc_perf_init done domain=%d\n", __func__, domain);
+
+  printk("%s: calling get_dsp_dma_reverse_rpc_map_capability domain=%d\n", __func__, domain);
   get_dsp_dma_reverse_rpc_map_capability(domain);
+  printk("%s: get_dsp_dma_reverse_rpc_map_capability done domain=%d\n", __func__, domain);
+
   hlist[domain].state = FASTRPC_DOMAIN_STATE_INIT;
   hlist[domain].ref = 0;
   pthread_mutex_unlock(&hlist[domain].mut);
   mut_locked = 0;
+
+  printk("%s: calling listener_android_domain_init domain=%d, tid=%p\n", __func__, domain, (void *)k_current_get());
   VERIFY(AEE_SUCCESS == (nErr = listener_android_domain_init(
                              domain, hlist[domain].th_params.update_requested,
                              &hlist[domain].th_params.r_sem)));
+  LOG_INF("%s: post listener_android_domain_init ", __func__);
+  printk("%s: listener_android_domain_init done domain=%d\n", __func__, domain);
   if ((dom != SDSP_DOMAIN_ID) && hlist[domain].dsppd == ROOT_PD) {
     remote_handle64 handle = 0;
     handle = get_adspmsgd_adsp1_handle(domain);
@@ -3892,8 +4209,8 @@ static void exit_thread(void *value) {
           INVALID_HANDLE) {
         nErr = adsp_current_process1_thread_exit(handle);
         if (nErr) {
-          FARF(RUNTIME_RPC_HIGH, "%s: nErr:0x%x, dom:%d, h:0x%" PRIx64,
-               __func__, nErr, domain, handle);
+          FARF(RUNTIME_RPC_HIGH, "%s: nErr:0x%x, dom:%d, h:0x%llx", __func__, nErr,
+               domain, handle);
         }
       } else if (domain == DEFAULT_DOMAIN_ID) {
         nErr = adsp_current_process_thread_exit();
@@ -3926,6 +4243,7 @@ static int fastrpc_apps_user_init(void) {
   VERIFY(AEE_SUCCESS == (nErr = PL_INIT(gpls)));
   VERIFY(AEE_SUCCESS == (nErr = PL_INIT(rpcmem)));
   VERIFY(AEE_SUCCESS == (nErr = PL_INIT(apps_std)));
+  LOG_INF(" %s: tlsKey created. ", __func__);
   VERIFY(AEE_SUCCESS == (nErr = pthread_key_create(&tlsKey, exit_thread)));
 #ifdef PARSE_YAML
   configure_dsp_paths();
@@ -3933,7 +4251,7 @@ static int fastrpc_apps_user_init(void) {
   fastrpc_mem_init();
   fastrpc_context_table_init();
   fastrpc_log_init();
-  fastrpc_config_init();
+  //fastrpc_config_init(); /* sys_init boot up failure here */
   pthread_mutex_init(&update_notif_list_mut, 0);
   VERIFYC(NULL != (hlist = calloc(NUM_DOMAINS_EXTEND, sizeof(*hlist))),
           AEE_ENOMEMORY);
@@ -3984,6 +4302,7 @@ static void frpc_init(void) { PL_INIT(fastrpc_apps_user); }
 
 int fastrpc_init_once(void) {
   static pthread_once_t frpc = PTHREAD_ONCE_INIT;
+  LOG_INF(" %s: start. ", __func__);
   int nErr = AEE_SUCCESS;
   VERIFY(AEE_SUCCESS == (nErr = pthread_once(&frpc, (void *)frpc_init)));
 bail:
@@ -4062,6 +4381,18 @@ static void check_multilib_util(void) {
   }
 }
 
+#ifndef __ZEPHYR__
+/*
+ * multidsplib_env_init — Linux-only multilib instance check.
+ *
+ * This constructor uses getpid(), setenv(), and getenv() to detect multiple
+ * instances of the DSP library loaded in the same process.  On Zephyr:
+ *   - There is no shared-library / dlopen model (no multiple instances).
+ *   - getpid() returns 0; setenv()/getenv() may not behave as expected.
+ *   - FOR_EACH_DOMAIN_ID iterates NUM_DOMAINS (8) times but the array below
+ *     only has 7 initializers, causing a NULL-pointer crash at index 7.
+ * Guard the entire function with #ifndef __ZEPHYR__ to skip it on Zephyr.
+ */
 __CONSTRUCTOR_ATTRIBUTE__
 static void multidsplib_env_init(void) {
   const char *local_fastrpc_lib_refcnt[NUM_DOMAINS] = {
@@ -4095,5 +4426,6 @@ static void multidsplib_env_init(void) {
   check_multilib_util();
   FARF(ALWAYS, "%s: %s loaded", __func__, fastrpc_library[DEFAULT_DOMAIN_ID]);
 }
+#endif /* !__ZEPHYR__ */
 
 PL_DEFINE(rpcmem, rpcmem_init_me, rpcmem_deinit_me);

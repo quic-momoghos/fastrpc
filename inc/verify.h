@@ -89,6 +89,37 @@ extern const char *__progname;
 #endif
 
 /* end syslog */
+#elif defined(__ZEPHYR__)
+/*
+ * Zephyr: use printk() instead of printf().
+ *
+ * printf() on Zephyr is routed through the deferred logging subsystem
+ * (CONFIG_LOG_PRINTK=y, CONFIG_LOG_MODE_DEFERRED=y).  Log messages are
+ * buffered in the 64 KB MPSC ring buffer and processed asynchronously by
+ * the log processing thread.  This causes VERIFY_EPRINTF output to appear
+ * out-of-order or interleaved with other log output ("distorted logs").
+ *
+ * printk() bypasses the deferred log system entirely — it writes directly
+ * and synchronously to the UART console (CONFIG_UART_CONSOLE=y), so error
+ * and warning messages appear immediately at the point of failure.
+ */
+#include <zephyr/sys/printk.h>
+
+#ifdef VERIFY_PRINT_INFO
+#define VERIFY_IPRINTF(format, ...) printk(__V_FILE_LINE__ format "\n", ##__VA_ARGS__)
+#endif
+
+#ifdef VERIFY_PRINT_ERROR
+#define VERIFY_EPRINTF(format, ...) printk(__V_FILE_LINE__ format "\n", ##__VA_ARGS__)
+#endif
+
+#define VERIFY_EPRINTF_ALWAYS(format, ...) printk(__V_FILE_LINE__ format "\n", ##__VA_ARGS__)
+
+#ifdef VERIFY_PRINT_WARN
+#define VERIFY_WPRINTF(format, ...) printk(__V_FILE_LINE__ format "\n", ##__VA_ARGS__)
+#endif
+
+/* end Zephyr */
 #else
 /* generic */
 
@@ -164,4 +195,3 @@ extern const char *__progname;
 #endif //VERIFYM
 
 #endif //VERIFY_H
-

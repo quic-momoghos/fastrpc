@@ -1194,7 +1194,12 @@ __QAIC_REMOTE_EXPORT __QAIC_RETURN int __QAIC_REMOTE(remote_munmap64)(__QAIC_IN 
  *       The mapping persists until explicitly unmapped via fastrpc_munmap() or
  *       the fastrpc session is closed.
  */
+/* On Zephyr, fastrpc_mmap() is a static inline in <zephyr/drivers/fastrpc.h>
+ * with a different signature (device pointer + message struct).  Guard the
+ * Linux declaration to avoid a conflicting-types error. */
+#ifndef __ZEPHYR__
 __QAIC_REMOTE_EXPORT __QAIC_RETURN int __QAIC_REMOTE(fastrpc_mmap)(__QAIC_IN int domain, __QAIC_IN int fd, __QAIC_IN void *addr, __QAIC_IN int offset, __QAIC_IN size_t length, __QAIC_IN enum fastrpc_map_flags flags)__QAIC_REMOTE_ATTRIBUTE;
+#endif /* !__ZEPHYR__ */
 
 
 /**
@@ -1217,7 +1222,10 @@ __QAIC_REMOTE_EXPORT __QAIC_RETURN int __QAIC_REMOTE(fastrpc_mmap)(__QAIC_IN int
  * @note This API must be called to cleanup mappings before closing DMA file descriptors.
  *       Failing to unmap can lead to resource leaks in the driver.
  */
+/* Same guard for fastrpc_munmap() — see fastrpc_mmap() note above. */
+#ifndef __ZEPHYR__
 __QAIC_REMOTE_EXPORT __QAIC_RETURN int __QAIC_REMOTE(fastrpc_munmap)(__QAIC_IN int domain, __QAIC_IN int fd, __QAIC_IN void *addr, __QAIC_IN size_t length)__QAIC_REMOTE_ATTRIBUTE;
+#endif /* !__ZEPHYR__ */
 
 
 /**

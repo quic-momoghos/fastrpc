@@ -19,14 +19,19 @@
 
 
 /* Number of subsystem supported by fastRPC*/
+#ifdef __ZEPHYR__
 #ifndef NUM_DOMAINS
 #define NUM_DOMAINS 8
 #endif /*NUM_DOMAINS*/
+#else
+#ifndef NUM_DOMAINS
+#define NUM_DOMAINS 8
+#endif /*NUM_DOMAINS*/
+#endif /* __ZEPHYR__ */
 
-/* Number of sessions allowed per process */
 #ifndef NUM_SESSIONS
 #define NUM_SESSIONS 4
-#define DOMAIN_ID_MASK 7
+#define DOMAIN_ID_MASK 7 /* cacao:1, else : 7*/
 #endif /*NUM_SESSIONS*/
 
 /* Default domain id, in case of non domains*/

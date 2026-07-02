@@ -116,7 +116,16 @@ typedef int                AEEResult;
 //! @cond Doxygen_Suppress
 #ifndef __QIDL_WCHAR_T_DEFINED__
 #define __QIDL_WCHAR_T_DEFINED__
+/*
+ * Skip the typedef when picolibc's inttypes.h has already defined _wchar_t
+ * as __WCHAR_TYPE__ (unsigned int on ARM).  The zephyr_compat/inttypes.h
+ * shim sets ZEPHYR_COMPAT_INTTYPES_H_ after including picolibc's inttypes.h,
+ * so its presence means _wchar_t is already defined and redefining it here
+ * as uint16_t would cause a "typedef redefinition with different types" error.
+ */
+#ifndef ZEPHYR_COMPAT_INTTYPES_H_
 typedef uint16_t _wchar_t;
+#endif
 #endif
 
 

@@ -1,0 +1,114 @@
+# Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
+menuconfig FASTRPC_UMD
+	bool "FastRPC User Mode Driver (UMD)"
+	depends on FASTRPC
+	select POSIX_API
+	select PTHREAD_IPC
+	help
+	  Enable the FastRPC User Mode Driver library.
+
+	  This library provides the user-space RPC interface for offloading
+	  compute workloads to Qualcomm DSP subsystems (ADSP, CDSP, SDSP, …)
+	  via the FastRPC framework.
+
+	  The Zephyr port replaces the Linux ioctl() layer with a direct call
+	  into the Zephyr fastrpc driver API declared in
+	  <zephyr/drivers/fastrpc.h>.  The OSAL translation is implemented in
+	  src/OSAL/fastrpc_ioctl_zephyr.c.
+
+	  Requires CONFIG_FASTRPC (the Zephyr fastrpc driver).
+
+if FASTRPC_UMD
+
+config FASTRPC_UMD_FULL
+	bool "Include all UMD source modules (work-in-progress)"
+	default n
+	help
+	  When enabled, the build includes the full set of UMD source files
+	  (fastrpc_apps_user.c, rpcmem, listener, stubs/skels, dspqueue, …).
+
+	  Many of these files still carry Linux-specific dependencies
+	  (dirent, mmap, eventfd, inotify, dlopen, …) that have not yet been
+	  ported to Zephyr.  Enable this option only after those files have
+	  been adapted, or to identify the next set of porting work.
+
+	  Leave disabled (default) to build only the OSAL layer and the
+	  port-friendly utility modules.
+
+config FASTRPC_UMD_NUM_DOMAINS
+	int "Number of DSP domains"
+	default 8
+	help
+	  Number of DSP subsystem domains supported by the UMD.
+	  Must match NUM_DOMAINS in inc/fastrpc_common.h (default 8).
+
+config FASTRPC_UMD_DEFAULT_DOMAIN
+	int "Default DSP domain ID"
+	default 3
+	help
+	  Domain ID used when no explicit domain is specified by the caller.
+	  3 = CDSP (Compute DSP) — the most common offload target.
+	  Must match DEFAULT_DOMAIN_ID in inc/fastrpc_common.h.
+
+config FASTRPC_UMD_LOG_LEVEL
+	int "UMD FARF log verbosity (0=off … 3=low)"
+	default 1
+	range 0 3
+	help
+	  Controls which FARF log levels are compiled in for the UMD.
+	    0 — only FARF(CRITICAL) and FARF(ERROR)
+	    1 — adds FARF(HIGH)   (default)
+	    2 — adds FARF(MED)
+	    3 — adds FARF(LOW)
+
+config FASTRPC_LISTENER_STACK_SIZE
+	int "Listener thread stack size (bytes)"
+	default 16384
+	help
+	  Stack size in bytes for each pre-allocated fastrpc listener thread.
+	  16 KB is required: listener() places remote_arg args[512] on the
+	  stack (8192 bytes on ARM64) plus call overhead, which overflows
+	  an 8 KB stack.  Increase only if deeper call chains are added.
+
+config FASTRPC_LISTENER_MAX_DOMAINS
+	int "Number of concurrent listener thread stacks"
+	default 4
+	help
+	  Number of pre-allocated listener thread stacks.  Each stack costs
+	  CONFIG_FASTRPC_LISTENER_STACK_SIZE bytes in the noinit section.
+
+	  Set to 1 when only the rootpd daemon runs (single-domain).
+	  Set to 2 when rootpd and audiopd run simultaneously.
+	  Set to 3 (default) when rootpd, audiopd, and sensorspd all run
+	  simultaneously — one stack slot per concurrent listener thread.
+	  Without this, daemons share stack slots and corrupt each other,
+	  causing a crash in listener_android_domain_init().
+
+	  Increase further if additional static PD daemons are added.
+
+config FASTRPC_LISTENER_INHERIT_PRIO
+	bool "Listener thread inherits calling daemon thread priority"
+	default y
+	help
+	  When enabled (default), the fastrpc listener thread created by
+	  listener_android_domain_init() inherits the scheduling priority of
+	  the calling daemon thread via PTHREAD_INHERIT_SCHED.
+
+	  The daemon threads (frpc_listener_thread, frpc_audiopd_thread) run
+	  at Zephyr priority 7.  Without inheritance the listener thread runs
+	  at the POSIX default (Zephyr priority 126 — the lowest application
+	  priority).  This causes starvation: when rootpd restarts 4 times at
+	  priority 7, the audiopd listener thread at priority 126 never gets
+	  scheduled, blocking audiopd domain_init for 3+ minutes until rootpd
+	  exits and permanently frees a CPU core.
+
+	  With PTHREAD_INHERIT_SCHED the listener thread runs at the same
+	  priority as the daemon (priority 7) and is scheduled immediately
+	  after pthread_create(), eliminating the starvation entirely.
+
+	  Disable only if explicit priority control via
+	  pthread_attr_setschedparam() is preferred.
+
+endif # FASTRPC_UMD

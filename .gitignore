@@ -44,3 +44,12 @@ test/fastrpc_test
 
 # make dist tarballs
 fastrpc-*.tar.gz
+
+# Zephyr build artifacts
+build/
+zephyr/.config
+zephyr/include/generated/
+*.elf
+*.bin
+*.hex
+*.map

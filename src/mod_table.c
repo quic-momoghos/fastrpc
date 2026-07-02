@@ -4,7 +4,9 @@
 #ifndef FARF_ERROR
 #define FARF_ERROR 1
 #endif
+#ifndef FARF_LOW
 #define FARF_LOW 1
+#endif
 
 #ifndef VERIFY_PRINT_ERROR_ALWAYS
 #define VERIFY_PRINT_ERROR_ALWAYS
@@ -75,8 +77,6 @@ static __inline const char *DLERROR(VOID) {
 #define DLSYM dlsym
 #define DLERROR dlerror
 #endif
-
-extern int errno;
 
 /**
  * structure for the mod table
@@ -549,9 +549,7 @@ static int open_mod_table_open_dynamic(struct open_mod_table *me,
         break;
       }
     }
-    /* Append "_system.so" to base name (avoid overlapping buffers in snprintf) */
-    strlcat(tmp, "_system.so", tmplen);
-    rv = strlen(tmp);
+    rv = snprintf(tmp, tmplen, "%s_system.so", tmp);
     VERIFYC((rv > 0) && (tmplen >= rv), AEE_EBADPARM);
     FARF(RUNTIME_RPC_HIGH, "calling dlopen for %s", tmp);
     dm->dlhandle = DLOPEN(tmp, RTLD_NOW);

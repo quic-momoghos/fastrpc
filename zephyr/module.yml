@@ -1,0 +1,6 @@
+name: fastrpc_umd
+build:
+  cmake: .
+  kconfig: Kconfig
+  depends:
+    - fastrpc_kmd
