@@ -44,6 +44,8 @@
 #include "OSAL/rpcmem_backend.h"
 #include "verify.h"
 
+#include <fastrpc_kmd/inc/fastrpc.h>   /* fastrpc_shared_alloc / fastrpc_shared_free */
+
 /* =========================================================================
  * Default backend: Zephyr system heap  (k_malloc / k_free)
  *
@@ -61,13 +63,17 @@
  * @flags:  rpcmem heap flags — unused by this backend; reserved for future
  *          backends that may select cached vs. uncached memory, etc.
  * @out_fd: set to -1 — heap memory has no associated file descriptor
+ * @out_dsp_shareable: set to 0 — plain heap memory is CPU-only and is NOT
+ *          shared with the DSP (no pool allocation, no DSP-visible IOVA).
  *
  * Returns a non-NULL pointer on success, NULL on failure.
  */
-static void *zephyr_heap_alloc(size_t size, uint32_t flags, int *out_fd)
+static void *zephyr_heap_alloc(size_t size, uint32_t flags, int *out_fd,
+			       uint32_t *out_dsp_shareable)
 {
 	ARG_UNUSED(flags);
 	*out_fd = -1; /* no fd concept for plain heap memory */
+	*out_dsp_shareable = 0; /* CPU-only; not shared with the DSP */
 	return k_malloc(size);
 }
 
@@ -91,12 +97,69 @@ static const struct rpcmem_backend_ops zephyr_heap_backend = {
 	.free  = zephyr_heap_free,
 };
 
+/* =========================================================================
+ * FR pool backend: FastRPC DSP-shareable memory  (fastrpc_shared_alloc/free)
+ *
+ * This is the default backend.  It allocates from the same FASTRPC_PHYS_POOL
+ * the KMD driver uses, so an rpcmem buffer is physically identical to a
+ * driver-allocated one and can be given a DSP-visible IOVA lazily at invoke
+ * time.  Buffers from this backend are marked dsp_shareable = 1; the fd stays
+ * -1 (Zephyr has no dma-buf fd — the buffer VA, not an fd, identifies it).
+ * =========================================================================
+ */
+
+/**
+ * fr_pool_alloc() - allocate DSP-shareable memory from the FastRPC pool
+ *
+ * @size:   number of bytes to allocate
+ * @flags:  rpcmem heap flags — unused (pool memory is cached WB; coherency is
+ *          handled by the invoke path's flush/invalidate)
+ * @out_fd: set to -1 — no dma-buf fd concept on Zephyr
+ * @out_dsp_shareable: set to 1 on success — the buffer is shared with the DSP
+ *
+ * Returns a non-NULL CPU virtual address on success, NULL on failure.
+ */
+static void *fr_pool_alloc(size_t size, uint32_t flags, int *out_fd,
+			   uint32_t *out_dsp_shareable)
+{
+	void *va;
+
+	ARG_UNUSED(flags);
+	va = fastrpc_shared_alloc(size);
+	*out_fd = -1;                       /* no fd on Zephyr */
+	*out_dsp_shareable = (va != NULL) ? 1u : 0u;
+	return va;
+}
+
+/**
+ * fr_pool_free() - release memory allocated by fr_pool_alloc()
+ *
+ * @buf:  pointer previously returned by fr_pool_alloc()
+ * @fd:   ignored (-1 for this backend)
+ * @size: ignored (the registry remembers the size)
+ */
+static void fr_pool_free(void *buf, int fd, size_t size)
+{
+	ARG_UNUSED(fd);
+	ARG_UNUSED(size);
+	fastrpc_shared_free(buf);
+}
+
+/** FastRPC pool backend ops — the default DSP-shareable allocator. */
+static const struct rpcmem_backend_ops fr_pool_backend = {
+	.alloc = fr_pool_alloc,
+	.free  = fr_pool_free,
+};
+
 /*
  * active_backend points to the ops that rpcmem_alloc_internal() and
- * rpcmem_free_internal() will call.  Defaults to the Zephyr heap backend.
- * Override with rpcmem_register_backend() before rpcmem_init().
+ * rpcmem_free_internal() will call.  Defaults to the FastRPC pool backend so
+ * that rpcmem_alloc() returns DSP-shareable memory (mirrors Linux, where
+ * rpcmem is always backed by the dma-heap).  Override with
+ * rpcmem_register_backend() before rpcmem_init(); pass NULL there to restore
+ * this default.
  */
-static const struct rpcmem_backend_ops *active_backend = &zephyr_heap_backend;
+static const struct rpcmem_backend_ops *active_backend = &fr_pool_backend;
 
 /* =========================================================================
  * Backend registration  (public API — declared in inc/OSAL/rpcmem_backend.h)
@@ -113,7 +176,7 @@ static const struct rpcmem_backend_ops *active_backend = &zephyr_heap_backend;
  */
 void rpcmem_register_backend(const struct rpcmem_backend_ops *ops)
 {
-	active_backend = (ops != NULL) ? ops : &zephyr_heap_backend;
+	active_backend = (ops != NULL) ? ops : &fr_pool_backend;
 }
 
 /* =========================================================================
@@ -138,14 +201,22 @@ static struct k_mutex rpcmt;
  *               backend may return a larger slab and set aligned_buf to
  *               the first page-aligned address within it.
  * @size:        allocation size passed to the backend
- * @fd:          pseudo file-descriptor returned by the backend (-1 if none)
+ * @fd:          pseudo file-descriptor returned by the backend (-1 if none).
+ *               Kept for Linux/dma-buf parity and the invoke wire format
+ *               (rpra.dma.fd); on Zephyr it is always -1.
+ * @dsp_shareable: 1 when this buffer is shared with the DSP (allocated from
+ *               the FastRPC pool, so it can be IOMMU-mapped for the DSP);
+ *               0 for CPU-only heap memory.  Mirrors the "dma" marker in the
+ *               Linux struct rpc_info.  This flag — not @fd — is what marks a
+ *               buffer for the DSP map path.
  */
 struct rpc_info {
-	QNode   qn;
-	void   *buf;
-	void   *aligned_buf;
-	size_t  size;
-	int     fd;
+	QNode    qn;
+	void    *buf;
+	void    *aligned_buf;
+	size_t   size;
+	int      fd;
+	uint32_t dsp_shareable;
 };
 
 /* =========================================================================
@@ -208,6 +279,33 @@ int rpcmem_to_fd(void *po)
 }
 
 /**
+ * rpcmem_is_dsp_shareable() - report whether a buffer is shared with the DSP
+ * @po: aligned_buf pointer previously returned by rpcmem_alloc_internal()
+ *
+ * Returns 1 when the buffer was allocated from the FastRPC pool (it can be
+ * IOMMU-mapped and given a DSP-visible IOVA), 0 otherwise (CPU-only heap
+ * memory, or the pointer is not a live rpcmem allocation).  This is the
+ * discriminator that replaces the fd sentinel on Zephyr.
+ */
+uint32_t rpcmem_is_dsp_shareable(void *po)
+{
+	struct rpc_info *rinfo;
+	QNode *pn, *pnn;
+	uint32_t shareable = 0;
+
+	k_mutex_lock(&rpcmt, K_FOREVER);
+	QLIST_NEXTSAFE_FOR_ALL(&rpclst, pn, pnn) {
+		rinfo = STD_RECOVER_REC(struct rpc_info, qn, pn);
+		if (rinfo->aligned_buf == po) {
+			shareable = rinfo->dsp_shareable;
+			break;
+		}
+	}
+	k_mutex_unlock(&rpcmt);
+	return shareable;
+}
+
+/**
  * rpcmem_alloc_internal() - allocate a shared memory buffer
  * @heapid: heap identifier forwarded to the backend for future use;
  *          the default heap backend ignores it
@@ -222,6 +320,7 @@ void *rpcmem_alloc_internal(int heapid, uint32_t flags, size_t size)
 {
 	struct rpc_info *rinfo = NULL;
 	int fd = -1;
+	uint32_t dsp_shareable = 0;
 	void *buf;
 
 	if (size == 0) {
@@ -230,7 +329,7 @@ void *rpcmem_alloc_internal(int heapid, uint32_t flags, size_t size)
 	}
 
 	/* ---- Step 1: allocate raw memory from the active backend ---------- */
-	buf = active_backend->alloc(size, flags, &fd);
+	buf = active_backend->alloc(size, flags, &fd, &dsp_shareable);
 	if (!buf) {
 		FARF(ERROR,
 		     "Error: backend alloc failed heapid %d size %zu flags %u",
@@ -254,17 +353,18 @@ void *rpcmem_alloc_internal(int heapid, uint32_t flags, size_t size)
 	 * larger slab should set aligned_buf to the first page-aligned address
 	 * within the slab (and adjust size accordingly).
 	 */
-	rinfo->aligned_buf = buf;
-	rinfo->size        = size;
-	rinfo->fd          = fd;
+	rinfo->aligned_buf   = buf;
+	rinfo->size          = size;
+	rinfo->fd            = fd;
+	rinfo->dsp_shareable = dsp_shareable;
 
 	/* ---- Step 4: add to the live-allocation list ---------------------- */
 	k_mutex_lock(&rpcmt, K_FOREVER);
 	QList_AppendNode(&rpclst, &rinfo->qn);
 	k_mutex_unlock(&rpcmt);
 
-	printk("rpcmem_alloc: heapid %d size %zu ptr %p fd %d",
-	     heapid, size, rinfo->aligned_buf, fd);
+	printk("rpcmem_alloc: heapid %d size %zu ptr %p fd %d dsp_shareable %u",
+	     heapid, size, rinfo->aligned_buf, fd, dsp_shareable);
 
 	/* ---- Step 5: register with the FastRPC framework ------------------ */
 	remote_register_buf(rinfo->buf, rinfo->size, rinfo->fd);

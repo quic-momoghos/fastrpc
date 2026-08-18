@@ -35,7 +35,14 @@ extern "C" {
  *                   use these to select a memory type (cached, uncached, …).
  *         @out_fd - OUTPUT: set to a file-descriptor or pseudo-fd that
  *                   uniquely identifies the buffer (e.g. a DMA-buf fd).
- *                   Set to -1 when no fd concept applies (heap backend).
+ *                   Set to -1 when no fd concept applies (heap/FR backend).
+ *         @out_dsp_shareable - OUTPUT: set to 1 when the returned buffer is
+ *                   shared with the DSP (allocated from the FastRPC pool, so
+ *                   it can be IOMMU-mapped and given a DSP-visible IOVA); set
+ *                   to 0 for CPU-only memory.  On Zephyr this flag — not
+ *                   @out_fd — is the discriminator the invoke/map path uses to
+ *                   decide whether an arg is mapped for the DSP or copied
+ *                   inline.  Mirrors the "dma" marker in Linux struct rpc_info.
  *         Returns a non-NULL pointer on success, NULL on failure.
  *
  * @free:  Release a buffer previously returned by @alloc.
@@ -44,7 +51,8 @@ extern "C" {
  *         @size - the original allocation size passed to @alloc.
  */
 struct rpcmem_backend_ops {
-	void *(*alloc)(size_t size, uint32_t flags, int *out_fd);
+	void *(*alloc)(size_t size, uint32_t flags, int *out_fd,
+		       uint32_t *out_dsp_shareable);
 	void  (*free)(void *buf, int fd, size_t size);
 };
 

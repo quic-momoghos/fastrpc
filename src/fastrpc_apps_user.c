@@ -1298,6 +1298,19 @@ int remote_handle_invoke_domain(int domain, remote_handle handle,
         set_args_fd(i, fd);
         req = INVOKE_FD;
       }
+#ifdef __ZEPHYR__
+      /* Zephyr has no dma-buf fd (fd is always -1), so the fd!=-1 test above
+       * can never select a DSP-mapped buffer.  Use the rpcmem pool marker
+       * instead: buffers allocated from the FastRPC pool are DSP-shareable and
+       * must be IOMMU-mapped by the KMD.  Carry that across the UMD->KMD
+       * boundary in args[i].attr; the KMD consumes it in place of fd==0||-1. */
+      else if (rpcmem_is_dsp_shareable(pra[i].buf.pv)) {
+        req = INVOKE_ATTRS;
+        append_args_attr(i, FASTRPC_ATTR_DSP_SHAREABLE);
+        VERIFY_IPRINTF("dsp-shareable buffer idx: %d addr: %p size: %d", i,
+                       pra[i].buf.pv, pra[i].buf.nLen);
+      }
+#endif
       if (nova) {
         req = INVOKE_ATTRS;
         append_args_attr(i, FASTRPC_ATTR_NOVA);
@@ -3664,7 +3677,7 @@ static int remote_init(int domain) {
   char *file = NULL;
   int flags = 0, filelen = 0, memlen = 0, filefd = -1;
 
-  FARF(RUNTIME_RPC_HIGH, "starting %s, tid: %p for domain %d", __func__, (void *)k_current_get(), domain);
+  FARF(ALWAYS, "starting %s, tid: %p for domain %d", __func__, (void *)k_current_get(), domain);
   /*
    * is_proc_sharedbuf_supported_dsp call should be made before
    * mutex lock (hlist[domain].mut), Since remote_get_info is also locked

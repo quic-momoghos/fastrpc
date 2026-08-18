@@ -195,6 +195,15 @@ void rpcmem_free(void* po);
 int rpcmem_to_fd(void* po);
 
 /**
+ * Report whether an RPCMEM buffer is shared with the DSP.
+ * @param[in] po  Data pointer for an RPCMEM-allocated buffer.
+ * @return        1 if the buffer is DSP-shareable (allocated from the FastRPC
+ *                pool, mappable to a DSP-visible IOVA); 0 otherwise (CPU-only
+ *                memory, or not a live RPCMEM allocation).
+ */
+uint32_t rpcmem_is_dsp_shareable(void* po);
+
+/**
  * @}
  */
 
